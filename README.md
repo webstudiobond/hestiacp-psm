@@ -14,12 +14,12 @@ Based on [php](https://github.com/oulfr/php/) by oulfr.
 
 To install the service and ensure it runs on startup, follow these steps:
 
-1. Create the systemd service:
+1. Create the systemd <a href="https://raw.githubusercontent.com/webstudiobond/hestiacp-psm/refs/heads/main/etc/systemd/system/process-slice-manager.service" target="_blank">service</a>:
     ```bash
     sudo nano /etc/systemd/system/process-slice-manager.service
     ```
 
-2. Create a script and make it executable:
+2. Create a <a href="https://raw.githubusercontent.com/webstudiobond/hestiacp-psm/refs/heads/main/usr/local/hestia/bin/process-slice-manager" target="_blank">script</a> and make it executable:
     ```bash
     sudo nano /usr/local/hestia/bin/process-slice-manager && \
     sudo chmod +x /usr/local/hestia/bin/process-slice-manager
