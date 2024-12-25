@@ -1,0 +1,439 @@
+#!/bin/bash
+
+# Configuration
+PIDFILE="/var/run/process-slice-manager.pid"  # PID file for the process
+LOG_FILE="/var/log/process-slice-manager.log"  # Log file for the process
+LOG_MAX_SIZE=$((5 * 1024 * 1024))  # Maximum log size set to 5MB in bytes
+CGROUP_BASE="/sys/fs/cgroup"  # Base path for cgroup v2
+POLL_INTERVAL=2  # Polling interval in seconds
+UNLIMITED_BYTES=$((1024 * 1024 * 1024 * 1024))  # Represents unlimited bytes (1TB)
+
+# Function to check and configure cgroup v2
+check_cgroup_v2() {
+    log "INFO" "Checking cgroup v2"
+
+    # Check if the cgroup.controllers file exists
+    if [ -f "$CGROUP_BASE/cgroup.controllers" ]
+    then
+        # Enable required controllers in the root group
+        for controller in "cpu" "cpuset" "memory" "io"
+        do
+            echo "+$controller" > "$CGROUP_BASE/cgroup.subtree_control" || \
+            log "ERROR" "Failed to enable $controller controller in cgroup v2"
+        done
+
+        # Check if required cgroup controllers are available
+        local available_controllers=$(cat "$CGROUP_BASE/cgroup.controllers")
+
+        # Verify that all required controllers are available
+        for required_controller in "cpu" "cpuset" "memory" "io"
+        do
+            if [[ ! "$available_controllers" =~ "$required_controller" ]]
+            then
+                log "ERROR" "Required controller '$required_controller' not available in cgroup v2"
+                exit 1
+            fi
+        done
+
+        log "INFO" "Cgroup v2 detected and configured - Using unified hierarchy"
+    else
+        log "ERROR" "Cgroup v2 not detected"
+        exit 1
+    fi
+}
+
+# Declare associative arrays
+declare -A USER_DATA
+declare -A PACKAGE_DATA
+
+# Ensure required dependencies are available
+REQUIRED_CMDS=("jq" "ps" "nproc" "shuf" "bc" "sort" "tr" "sed")  # List of required commands
+
+# Loop through each command in the required commands array
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    # Check if the command is available in the system
+    if ! command -v "$cmd" &>/dev/null; then
+        # Print an error message to standard error if the command is not found
+        echo "Error: Required command '$cmd' is not installed." >&2
+        exit 1  # Exit the script with a non-zero status code
+    fi
+done
+
+# Check log file size and rotate it if needed
+log_size_rotation() {
+    # Check if the log file exists
+    if [[ ! -f "$LOG_FILE" ]]
+    then
+        touch "$LOG_FILE"  # Create the log file if it does not exist
+        chmod 640 "$LOG_FILE"  # Set permissions for the log file
+        return  # Exit the function
+    fi
+
+    local rotate=0  # Initialize rotation flag
+
+    # Check the size of the log file
+    local size=$(stat -c%s "$LOG_FILE" 2>/dev/null)  # Get the size of the log file
+    if [[ $size -gt $LOG_MAX_SIZE ]]
+    then
+        rotate=1  # Set rotation flag if the log file exceeds the maximum size
+    fi
+
+    # Rotate the log file if needed
+    if [[ $rotate -eq 1 ]]
+    then
+        true > "$LOG_FILE"  # Clear the log file
+        touch "$LOG_FILE"  # Update the file creation time
+        chmod 640 "$LOG_FILE"  # Set permissions for the log file
+        log "INFO" "Log file rotated due to size"  # Log the rotation event
+    fi
+}
+
+# Logging function with levels
+log() {
+    local level="$1"      # Log level (e.g., INFO, ERROR)
+    local message="$2"    # Log message to be recorded
+
+    log_size_rotation      # Call function to handle log size rotation
+
+    # Append the log entry with a timestamp, level, and message to the log file
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - [$level] $message" >> "$LOG_FILE"
+}
+
+
+convert_memory_limit() {
+    local limit="$1"  # Memory limit as a string
+    local value="${limit//[!0-9]/}"  # Extract numeric value
+    local unit="${limit//[0-9]/}"    # Extract unit
+
+    # Convert the memory limit based on the unit
+    case "${unit^^}" in
+        "K") 
+            echo $((value * 1024))  # Convert kilobytes to bytes
+            ;;
+        "M") 
+            echo $((value * 1024 * 1024))  # Convert megabytes to bytes
+            ;;
+        "G") 
+            echo $((value * 1024 * 1024 * 1024))  # Convert gigabytes to bytes
+            ;;
+        "T") 
+            echo $((value * 1024 * 1024 * 1024 * 1024))  # Convert terabytes to bytes
+            ;;
+        "") 
+            echo "$value"  # If no unit is provided, assume the value is in bytes
+            ;;
+        *) 
+            echo "Invalid unit: $unit" >&2  # Error handling for invalid units
+            return 1
+            ;;
+    esac
+}
+
+# Setup cgroup v2 slice
+setup_cgroup_v2_slice() {
+    local package="$1"
+    local cpu_quota="$2"
+    local cpu_period="$3"
+    local mem_limit="$4"
+    local swap_limit="$5"
+
+    # Create and setup the package directory
+    local package_dir="$CGROUP_BASE/$package"
+    mkdir -p "$package_dir" || { log "ERROR" "Failed to create package directory for $package"; return 1; }
+
+    # Enable controllers in package directory
+    for controller in "cpu" "cpuset" "io" "memory"
+    do
+        echo "+$controller" > "$package_dir/cgroup.subtree_control" || \
+        log "ERROR" "Failed to enable $controller controller in $package"
+    done
+
+    # Create and setup the tasks directory
+    local tasks_dir="$package_dir/tasks"
+    mkdir -p "$tasks_dir" || { log "ERROR" "Failed to create tasks directory for $package"; return 1; }
+
+    # Get the number of available CPU cores
+    local cpu_cores=$(nproc)
+
+    # Determine cores to use based on CPU quota
+    if [[ "$cpu_quota" != "unlimited" ]]
+    then
+        cpu_quota=${cpu_quota//%/} # Remove percentage sign
+        cores_to_use=$(echo "scale=0; ($cpu_quota + 99) / 100" | bc)  # Round upwards
+        if (( cores_to_use > cpu_cores ))
+        then
+            cores_to_use=$cpu_cores  # Limit to available number of cores
+        fi
+    else
+        cores_to_use=$cpu_cores # Use all available cores
+    fi
+
+    log "INFO" "Determined $cores_to_use cores out of total $cpu_cores CPU cores from CPU quota ${cpu_quota}% for $package"
+
+    # Set cpuset.cpus depending on cores_to_use
+    if (( cores_to_use == 1 ))
+    then
+        local random_core=$(shuf -i 0-$((cores_to_use - 1)) -n 1)
+        log "INFO" "Set cpuset.cpus: $random_core for $package"
+        echo "$random_core" > "$package_dir/tasks/cpuset.cpus" || \
+        log "ERROR" "Failed to set cpuset.cpus for $package"
+    else
+       local random_cores=$(shuf -i 0-$((cpu_cores - 1)) -n "$cores_to_use" | sort -n | tr '\n' ',' | sed 's/,$//')
+       log "INFO" "Set cpuset.cpus: $random_cores for $package"
+    echo "$random_cores" > "$package_dir/tasks/cpuset.cpus" || \
+    log "ERROR" "Failed to set cpuset.cpus for $package"
+    fi
+
+    # Set CPU limits in the tasks directory
+    if [[ "$cpu_quota" != "unlimited" && "$cpu_period" != "unlimited" ]]; then
+
+        # Convert period to microseconds based on unit
+        local period_us
+        if [[ "$cpu_period" =~ ms$ ]]
+        then
+            local ms=${cpu_period//ms/}
+            period_us=$((ms * 1000)) # Convert ms to microseconds
+        elif [[ "$cpu_period" =~ s$ ]]
+        then
+            local s=${cpu_period//s/}
+            period_us=$((s * 1000000)) # Convert ms to microseconds
+        else
+            # Default to 1s (1000000 µs) if no unit specified
+            period_us=1000000
+        fi
+
+        # Validate period boundaries
+        if (( period_us > 1000000 ))
+        then
+            # maximum period allowed is 1 second (1000000 µs)
+            log "WARN" "Period adjusted to maximum value (1s)"
+            period_us=1000000
+        fi
+        
+        if (( period_us < 100000 ))
+        then
+            # minimum period allowed is 100ms (100000 µs)
+            log "WARN" "Period adjusted to minimum value (100ms)"
+            period_us=100000
+        fi
+
+        # Calculate quota for all cores
+        cpu_quota=${cpu_quota//%/}
+        local quota_us=$((period_us * cpu_quota / 100))
+
+        # Validate minimum quota
+        if ((quota_us < 1000))
+        then
+            log "WARN" "CPU quota adjusted to minimum value (1000us)"
+            quota_us=1000
+        fi
+
+        log "INFO" "Set CPU quota: ${quota_us}us (${cpu_quota}%) for $package"
+        log "INFO" "Set period: ${period_us}us for $package"
+
+        echo "$quota_us $period_us" > "$tasks_dir/cpu.max" || \
+        log "ERROR" "Failed to set CPU limits for $package"
+    else
+        log "INFO" "Set unlimited CPU for $package"
+        echo "max 100000" > "$tasks_dir/cpu.max" || \
+        log "ERROR" "Failed to set unlimited CPU for $package"
+    fi
+
+    # Set Memory limits
+    if [[ "$mem_limit" != "unlimited" ]]
+    then
+        local mem_bytes=$(convert_memory_limit "$mem_limit")
+        if [ $? -eq 0 ] && [ -n "$mem_bytes" ]
+        then
+            log "INFO" "Set memory limit: $mem_bytes bytes for $package"
+            echo "$mem_bytes" > "$tasks_dir/memory.max" || \
+            log "ERROR" "Failed to set memory limit for $package"
+        else
+            log "ERROR" "Invalid memory limit format: $mem_limit"
+            return 1
+        fi
+    else
+        log "INFO" "Set unlimited memory for $package"
+        echo "max" > "$tasks_dir/memory.max" || \
+        log "ERROR" "Failed to set unlimited memory for $package"
+    fi
+
+    # Set Swap limits
+    if [[ "$swap_limit" != "unlimited" && "$mem_limit" != "unlimited" ]]
+    then
+        local swap_bytes=$(convert_memory_limit "$swap_limit")
+        if [ $? -eq 0 ] && [ -n "$swap_bytes" ]
+        then
+            log "INFO" "Set swap limit: $swap_bytes bytes for $package"
+            echo "$swap_bytes" > "$tasks_dir/memory.swap.max" || \
+            log "ERROR" "Failed to set swap limit for $package"
+        else
+            log "ERROR" "Invalid swap limit format: $swap_limit"
+            return 1
+        fi
+    else
+        log "INFO" "Set unlimited swap for $package"
+        echo "max" > "$tasks_dir/memory.swap.max" || \
+        log "ERROR" "Failed to set unlimited swap for $package"
+    fi
+}
+
+# Setup cgroup slices for packages
+setup_cgroup_slices() {
+    log "INFO" "Setting up cgroup slices for packages"
+
+    # Iterate over each user in the USER_DATA associative array
+    for user in "${!USER_DATA[@]}"
+    do
+        local data="${USER_DATA[$user]}"  # Get user data
+
+        local package=$(echo "$data" | jq -r '.PACKAGE')  # Extract package name
+
+        # Check if package is valid and not already set up
+        [[ -n "$package" && -z "${PACKAGE_DATA[$package]}" ]] || continue
+
+        # Extract resource limits from user data
+        local cpu_quota=$(echo "$data" | jq -r '.CPU_QUOTA')
+        local cpu_period=$(echo "$data" | jq -r '.CPU_QUOTA_PERIOD')
+        local mem_limit=$(echo "$data" | jq -r '.MEMORY_LIMIT')
+        local swap_limit=$(echo "$data" | jq -r '.SWAP_LIMIT')
+
+        log "INFO" "Package: $package - Initial values - CPU Quota: $cpu_quota, CPU Period: $cpu_period, Memory: $mem_limit, Swap: $swap_limit"
+
+        # Store package data in the associative array
+        PACKAGE_DATA["$package"]="$cpu_quota:$cpu_period:$mem_limit:$swap_limit"
+
+        # Setup cgroup v2 slice for the package
+        setup_cgroup_v2_slice "$package" "$cpu_quota" "$cpu_period" "$mem_limit" "$swap_limit"
+    done
+
+    log "INFO" "Cgroup v2 slices setup completed"
+}
+
+# Load user data from the Hestia CP
+load_user_data() {
+    log "INFO" "Loading user data"
+
+    # Fetch user data in JSON format
+    local users_json=$(/usr/local/hestia/bin/v-list-users json)
+
+    # Check if user data was fetched successfully
+    [[ -n "$users_json" ]] || {
+        log "ERROR" "Failed to fetch user data"
+        return
+    }
+
+    USER_DATA=()  # Initialize USER_DATA associative array
+    PACKAGE_DATA=()  # Initialize PACKAGE_DATA associative array
+
+    # Iterate over each user in the user data
+    while read -r user
+    do
+        # Extract user data and store it in the USER_DATA array
+        USER_DATA["$user"]=$(echo "$users_json" | jq -c --arg user "$user" '.[$user]')
+
+        log "INFO" "Loaded data for user: $user"
+    done < <(echo "$users_json" | jq -r 'keys[]')
+
+    # Setup cgroup slices for the loaded user data
+    setup_cgroup_slices
+}
+
+# Monitor resources and assign processes to cgroups
+monitor_resources() {
+    log "INFO" "Starting process monitoring"
+
+    declare -A known_processes  # Associative array to track known processes
+
+    while true
+    do
+        # Read the list of processes with their PID, user, and command
+        while read -r pid user comm
+        do
+            # Check if the user is not root and the process is not already known
+            if [[ "$user" != "root" && -z "${known_processes[$pid]}" ]]
+            then
+                # Get the package associated with the user
+                local package=$(echo "${USER_DATA[$user]}" | jq -r '.PACKAGE')
+
+                [[ -n "$package" ]] || continue  # Skip if no package is found
+
+                # Assign the PID to the corresponding cgroup
+                echo "$pid" > "$CGROUP_BASE/$package/tasks/cgroup.procs" 2>/dev/null || \
+                log "ERROR" "Failed to assign PID $pid to cgroup v2"
+
+                # Mark the process as known
+                known_processes["$pid"]="$user"
+
+                log "INFO" "Assigned PID $pid ($comm) of user $user to package $package"
+            fi
+        done < <(ps -eo pid=,user=,comm= --no-headers)  # Get the current processes
+
+        # Check for terminated processes
+        for pid in "${!known_processes[@]}"
+        do
+            if ! kill -0 "$pid" 2>/dev/null
+            then
+                log "INFO" "Process $pid terminated"
+                unset known_processes["$pid"]  # Remove the process from known processes
+            fi
+        done
+
+        sleep "$POLL_INTERVAL"  # Wait for the specified polling interval
+    done
+}
+
+# Cleanup
+cleanup() {
+    log "INFO" "Stopping service"
+
+    rm -f "$PIDFILE"
+
+    exit 0
+}
+
+# Main case statement to handle start and stop commands
+case "$1" in
+    start)
+        # Check if the PID file exists; if it does, the service is already running
+        [[ -f "$PIDFILE" ]] && { 
+            log "ERROR" "Service already running"; 
+            exit 1; 
+        }
+
+        # Write the current process ID to the PID file
+        echo $ > "$PIDFILE"
+
+        # Set up traps for cleanup on termination signals
+        trap cleanup SIGINT SIGTERM
+        trap 'load_user_data' SIGHUP
+
+        # Check the cgroup version
+        check_cgroup_v2
+        
+        # Load user data
+        load_user_data
+        
+        # Start monitoring resources
+        monitor_resources
+        ;;
+
+    stop)
+        # Check if the PID file exists to stop the service
+        if [[ -f "$PIDFILE" ]]; then
+            # Send TERM signal to the process and log the action
+            kill -TERM "$(cat "$PIDFILE")" && log "INFO" "Service stopped"
+            # Remove the PID file
+            rm -f "$PIDFILE"
+        else
+            # Log an error if the service is not running
+            log "ERROR" "Service not running"
+        fi
+        ;;
+    
+    *)
+        # Print usage information if the command is not recognized
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
