@@ -1,0 +1,15 @@
+[Unit]
+Description=Process Slice Manager Service for Hestia CP Package
+After=hestia.service
+Requires=hestia.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/hestia/bin/process-slice-manager start
+ExecStop=/usr/local/hestia/bin/process-slice-manager stop
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
